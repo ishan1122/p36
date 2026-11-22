@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-CHAT_MODEL = "gemini-2.5-flash"
+CHAT_MODEL = "gemini-3.8-flash"
 EMBEDDING_MODEL = "models/gemini-embedding-001"
 
 CHUNK_SIZE = 1000
