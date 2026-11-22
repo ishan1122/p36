@@ -1,110 +1,482 @@
+
 import os
 import tempfile
+import hashlib
 import streamlit as st
+
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_google_genai import (
+    GoogleGenerativeAIEmbeddings,
+    ChatGoogleGenerativeAI,
+)
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
 
 load_dotenv()
 
 st.set_page_config(
-    page_title="Research Paper Q&A (PS36)",
-    page_icon="📚",
+    page_title="PaperPilot | Research Paper Q&A",
+    page_icon="📘",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Sidebar configuration matching the project UI
+CHAT_MODEL = "gemini-2.5-flash"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+RETRIEVAL_K = 4
+
+# --------------------------------------------------
+# CUSTOM UI
+# --------------------------------------------------
+
+st.markdown("""
+<style>
+.block-container {
+    max-width: 1200px;
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+}
+.hero {
+    background: linear-gradient(120deg,#101d36,#294c72);
+    padding: 30px;
+    border-radius: 18px;
+    color: white;
+    margin-bottom: 25px;
+}
+.hero h1 {
+    color: white;
+    font-size: 34px;
+    margin-bottom: 5px;
+}
+.hero p {
+    color: #dbeafe;
+    font-size: 16px;
+}
+.info-card {
+    border: 1px solid rgba(128,128,128,.25);
+    border-radius: 14px;
+    padding: 18px;
+    min-height: 115px;
+}
+div.stButton > button {
+    border-radius: 10px;
+    min-height: 43px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# --------------------------------------------------
+# API KEY MANAGEMENT
+# --------------------------------------------------
+
+def get_api_key():
+
+    # Streamlit Cloud Secrets first
+    try:
+        key = st.secrets.get("GOOGLE_API_KEY", "")
+
+        if key:
+            return str(key).strip()
+
+    except Exception:
+        pass
+
+    # Local .env fallback
+    return os.getenv("GOOGLE_API_KEY", "").strip()
+
+
+# --------------------------------------------------
+# SIDEBAR
+# --------------------------------------------------
+
 with st.sidebar:
-    st.markdown("## Project information")
-    st.markdown("**Project:** Research Paper Q&A")
-    st.markdown("**Pipeline:** PDF -> chunks -> Gemini embeddings -> FAISS -> Gemini answer")
+
+    st.markdown("## 📘 PaperPilot")
+
+    st.caption("PS36 · Research Paper Q&A")
+
     st.divider()
 
-    default_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
-    api_key = st.text_input(
-        "Gemini API key",
-        value=default_key,
-        type="password",
-        placeholder="Paste your Gemini API key...",
+    st.markdown("### Project information")
+
+    st.write("**Project:** Research Paper Q&A")
+    st.write("**Technique:** Retrieval-Augmented Generation")
+    st.write("**Vector database:** FAISS")
+
+    st.divider()
+
+    api_key = get_api_key()
+
+    if api_key:
+        st.success("Gemini API key detected")
+    else:
+        st.error("Gemini API key missing")
+
+    st.caption(
+        "For Streamlit Cloud, configure GOOGLE_API_KEY "
+        "under Settings → Secrets."
     )
+
     model_name = st.text_input(
-        "Gemini model",
-        value="gemini-2.5-flash",
+        "Gemini chat model",
+        value=CHAT_MODEL,
     )
-    st.caption("Alternatively, set GOOGLE_API_KEY in your local .env file.")
 
-# Main Header
-st.markdown("# 📚 Research Paper Q&A")
-st.caption("PS36 · AI-powered academic paper analysis using Retrieval-Augmented Generation (RAG)")
-st.write("Upload a research paper and ask about its methodology, dataset, results and limitations.")
+    st.divider()
 
-uploaded_file = st.file_uploader("Upload research paper (PDF)", type=["pdf"])
+    if st.button("Test Gemini connection", use_container_width=True):
 
+        if not api_key:
+            st.error("API key not configured.")
+
+        else:
+            try:
+                test_embedding = GoogleGenerativeAIEmbeddings(
+                    model=EMBEDDING_MODEL,
+                    google_api_key=api_key,
+                )
+
+                test_embedding.embed_query("Test Gemini connection")
+
+                st.success("Gemini embedding connection successful!")
+
+            except Exception as e:
+                st.error(f"Connection failed: {e}")
+
+# --------------------------------------------------
+# HEADER
+# --------------------------------------------------
+
+st.markdown("""
+<div class="hero">
+    <h1>Research Paper Q&A</h1>
+    <p>
+        Your AI-powered research assistant.
+        Upload a research paper and explore its methodology,
+        datasets, findings and limitations.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+# --------------------------------------------------
+# SESSION STATE
+# --------------------------------------------------
+
+defaults = {
+    "vectorstore": None,
+    "processed_file_id": None,
+    "num_pages": 0,
+    "num_chunks": 0,
+    "paper_name": "",
+    "active_question": "",
+    "chat_history": [],
+}
+
+for key, value in defaults.items():
+
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+# --------------------------------------------------
+# PDF PROCESSING
+# --------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
-def build_vectorstore(pdf_bytes: bytes, gemini_api_key: str):
+def build_vectorstore(pdf_bytes, api_key, file_hash):
+
     tmp_path = None
+
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".pdf"
+        ) as tmp_file:
+
             tmp_file.write(pdf_bytes)
             tmp_path = tmp_file.name
 
         loader = PyPDFLoader(tmp_path)
+
         documents = loader.load()
 
         if not documents:
-            return None, 0
+            raise ValueError("No readable pages found in PDF.")
 
         for doc in documents:
-            doc.metadata["page_num"] = doc.metadata.get("page", 0) + 1
+
+            doc.metadata["page_num"] = (
+                doc.metadata.get("page", 0) + 1
+            )
 
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
             separators=["\n\n", "\n", ". ", " ", ""],
         )
+
         chunks = splitter.split_documents(documents)
 
+        if not chunks:
+            raise ValueError(
+                "No readable text found. "
+                "This PDF may be scanned or image-based."
+            )
+
         embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
-            google_api_key=gemini_api_key,
+            model=EMBEDDING_MODEL,
+            google_api_key=api_key,
         )
-        vectorstore = FAISS.from_documents(chunks, embeddings)
-        return vectorstore, len(documents)
+
+        vectorstore = FAISS.from_documents(
+            chunks,
+            embeddings,
+        )
+
+        return vectorstore, len(documents), len(chunks)
+
     finally:
+
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+# --------------------------------------------------
+# GEMINI ERROR HANDLING
+# --------------------------------------------------
 
-def answer_question(vectorstore, question: str, gemini_api_key: str, selected_model: str):
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+def show_friendly_error(error):
+
+    message = str(error).lower()
+
+    if (
+        "401" in message
+        or "unauthenticated" in message
+        or "access_token_type_unsupported" in message
+        or "api key not valid" in message
+    ):
+
+        st.error(
+            "Gemini authentication failed. Generate a fresh Gemini "
+            "API key in Google AI Studio and add it to Streamlit Cloud "
+            "Settings → Secrets as GOOGLE_API_KEY. Do not use an "
+            "OAuth access token. Reboot the app after saving."
+        )
+
+    elif "403" in message or "permission_denied" in message:
+
+        st.error(
+            "Google denied API access. Check your Gemini API "
+            "project permissions and API availability."
+        )
+
+    elif "429" in message or "resource_exhausted" in message:
+
+        st.error(
+            "Gemini API quota or rate limit reached. "
+            "Wait and try again."
+        )
+
+    else:
+
+        st.error(f"Error: {error}")
+
+# --------------------------------------------------
+# UPLOAD SECTION
+# --------------------------------------------------
+
+left, right = st.columns([1.4, 0.8])
+
+with left:
+
+    st.subheader("1. Upload research paper")
+
+    uploaded_file = st.file_uploader(
+        "Select a research paper PDF",
+        type=["pdf"],
+        help="Upload a text-based PDF.",
+    )
+
+with right:
+
+    st.subheader("About PaperPilot")
+
+    st.markdown("""
+    <div class="info-card">
+        <b>RAG-based research assistant</b>
+        <p>Extracts PDF text, retrieves relevant sections,
+        and generates answers with page references.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# --------------------------------------------------
+# PROCESS BUTTON
+# --------------------------------------------------
+
+if uploaded_file:
+
+    file_bytes = uploaded_file.getvalue()
+
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    st.caption(
+        f"Selected: {uploaded_file.name} · "
+        f"{len(file_bytes) / 1024 / 1024:.2f} MB"
+    )
+
+    if st.button(
+        "⚡ Process research paper",
+        type="primary",
+        use_container_width=True,
+    ):
+
+        if not api_key:
+
+            st.error(
+                "Configure GOOGLE_API_KEY in Streamlit Cloud Secrets."
+            )
+
+        else:
+
+            # Avoid retaining a previous paper's index.
+            if st.session_state.processed_file_id != file_hash:
+
+                st.session_state.vectorstore = None
+                st.session_state.chat_history = []
+
+            with st.spinner(
+                "Extracting PDF text and creating Gemini embeddings..."
+            ):
+
+                try:
+
+                    vectorstore, pages, chunks = build_vectorstore(
+                        file_bytes,
+                        api_key,
+                        file_hash,
+                    )
+
+                    st.session_state.vectorstore = vectorstore
+                    st.session_state.processed_file_id = file_hash
+                    st.session_state.num_pages = pages
+                    st.session_state.num_chunks = chunks
+                    st.session_state.paper_name = uploaded_file.name
+                    st.session_state.active_question = ""
+                    st.session_state.chat_history = []
+
+                    st.success(
+                        f"Successfully indexed {uploaded_file.name}"
+                    )
+
+                except Exception as e:
+
+                    show_friendly_error(e)
+
+                    with st.expander("Technical error details"):
+                        st.code(str(e))
+
+else:
+
+    st.info("Upload a PDF to begin.")
+
+# --------------------------------------------------
+# PAPER DASHBOARD
+# --------------------------------------------------
+
+if st.session_state.vectorstore is not None:
+
+    st.divider()
+
+    st.subheader("2. Paper overview")
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "PDF pages",
+        st.session_state.num_pages,
+    )
+
+    c2.metric(
+        "Text chunks",
+        st.session_state.num_chunks,
+    )
+
+    c3.metric(
+        "Retrieved passages",
+        RETRIEVAL_K,
+    )
+
+    st.caption(
+        f"Currently indexed: {st.session_state.paper_name}"
+    )
+
+# --------------------------------------------------
+# ANSWER FUNCTION
+# --------------------------------------------------
+
+def answer_question(
+    vectorstore,
+    question,
+    gemini_api_key,
+    selected_model,
+):
+
+    retriever = vectorstore.as_retriever(
+        search_kwargs={"k": RETRIEVAL_K}
+    )
+
     retrieved_docs = retriever.invoke(question)
 
-    formatted_chunks = []
+    if not retrieved_docs:
+        return (
+            "I could not find relevant information in the uploaded paper.",
+            [],
+        )
+
+    context_parts = []
+
     for doc in retrieved_docs:
-        page_num = doc.metadata.get("page_num", "?")
-        clean_text = doc.page_content.strip()
-        formatted_chunks.append(f"[Page {page_num}]\n{clean_text}")
 
-    context_text = "\n\n---\n\n".join(formatted_chunks)
+        page = doc.metadata.get("page_num", "?")
 
-    prompt = ChatPromptTemplate.from_template(
-        """You are a helpful research assistant. Answer the user's question strictly using the provided excerpts from the research paper.
-If the answer is not clearly supported by the excerpts, state that it is not mentioned in the provided context.
-Include page numbers (e.g., [Page 3]) when referencing claims.
-Format the response cleanly with bullet points where helpful.
+        context_parts.append(
+            f"[PDF Page {page}]\n{doc.page_content.strip()}"
+        )
 
-Context:
+    context = "\n\n---\n\n".join(context_parts)
+
+    prompt = ChatPromptTemplate.from_template("""
+You are an academic research paper assistant.
+
+Answer ONLY using the supplied excerpts from the uploaded PDF.
+
+Rules:
+1. Do not use outside knowledge.
+2. Never invent methods, datasets, metrics or results.
+3. If information is absent, say it is not found in the retrieved sections.
+4. Cite relevant PDF pages using [PDF Page X].
+5. Clearly distinguish author statements from your own inference.
+6. Use structured bullet points when useful.
+
+RESEARCH PAPER EXCERPTS:
+
 {context}
 
-Question: {question}
+USER QUESTION:
 
-Answer:"""
-    )
+{question}
+
+ANSWER:
+""")
 
     llm = ChatGoogleGenerativeAI(
         model=selected_model,
@@ -113,103 +485,141 @@ Answer:"""
     )
 
     chain = prompt | llm | StrOutputParser()
-    answer = chain.invoke({"context": context_text, "question": question})
+
+    answer = chain.invoke({
+        "context": context,
+        "question": question,
+    })
+
     return answer, retrieved_docs
 
-
-if "processed_file_id" not in st.session_state:
-    st.session_state.processed_file_id = None
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-if "num_pages" not in st.session_state:
-    st.session_state.num_pages = 0
-if "active_question" not in st.session_state:
-    st.session_state.active_question = ""
-
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    file_id = f"{uploaded_file.name}_{len(file_bytes)}"
-
-    if st.session_state.processed_file_id != file_id:
-        st.session_state.vectorstore = None
-        st.session_state.active_question = ""
-
-    if st.button("Process research paper", type="primary", use_container_width=True):
-        if not api_key.strip():
-            st.error("Please enter your Gemini API key in the sidebar before processing.")
-        else:
-            with st.spinner("Extracting text, generating embeddings, and indexing into FAISS..."):
-                try:
-                    vs, total_pages = build_vectorstore(file_bytes, api_key.strip())
-                    if vs is None:
-                        st.error("Could not extract readable text from this PDF.")
-                    else:
-                        st.session_state.vectorstore = vs
-                        st.session_state.num_pages = total_pages
-                        st.session_state.processed_file_id = file_id
-                        st.success(f"Indexed **{uploaded_file.name}** ({total_pages} pages) successfully!")
-                except Exception as e:
-                    st.error(f"Error indexing PDF: {e}")
-else:
-    st.info("Upload a PDF and select **Process research paper** to begin.")
-
-st.markdown("**Preset questions:** Method · Dataset · Results · Limitations")
+# --------------------------------------------------
+# QUESTION SECTION
+# --------------------------------------------------
 
 if st.session_state.vectorstore is not None:
+
     st.divider()
-    st.subheader("Ask the Research Paper")
+
+    st.subheader("3. Ask your research paper")
+
+    st.caption(
+        "Choose a preset question or ask something specific."
+    )
 
     col1, col2, col3, col4 = st.columns(4)
+
     if col1.button("🔬 Method", use_container_width=True):
+
         st.session_state.active_question = (
-            "What methodology, model architecture, or proposed approach is described in this research paper?"
+            "Explain the methodology, model architecture, "
+            "and proposed approach used in this paper."
         )
+
     if col2.button("📊 Dataset", use_container_width=True):
+
         st.session_state.active_question = (
-            "What datasets, benchmarks, or data preprocessing steps were used in this paper?"
+            "What datasets were used? Explain their sources, "
+            "size and preprocessing if reported."
         )
+
     if col3.button("🏆 Results", use_container_width=True):
+
         st.session_state.active_question = (
-            "What are the main experimental results, evaluation metrics, and key findings reported?"
+            "Explain the main experimental results, "
+            "evaluation metrics and findings."
         )
+
     if col4.button("⚠️ Limitations", use_container_width=True):
+
         st.session_state.active_question = (
-            "What limitations, failure cases, or future work directions are mentioned in this paper?"
+            "What limitations, weaknesses and future work "
+            "are discussed by the authors?"
         )
 
-    with st.form("custom_qa_form", clear_on_submit=False):
+    with st.form("question_form", clear_on_submit=True):
+
         user_input = st.text_input(
-            "Or enter a custom question:",
-            placeholder="e.g., How does the proposed model compare against baseline methods?",
+            "Your question",
+            placeholder="Ask anything about the research paper...",
         )
-        submitted = st.form_submit_button("Ask Question")
-        if submitted and user_input.strip():
-            st.session_state.active_question = user_input.strip()
 
-    if st.session_state.active_question:
-        if not api_key.strip():
-            st.error("Please provide your Gemini API key in the sidebar.")
-        else:
-            st.markdown(f"#### Question: *{st.session_state.active_question}*")
-            with st.spinner("Retrieving relevant passages and generating grounded answer..."):
-                try:
-                    answer, docs = answer_question(
-                        st.session_state.vectorstore,
-                        st.session_state.active_question,
-                        api_key.strip(),
-                        model_name.strip() or "gemini-2.5-flash",
-                    )
-                    st.markdown(answer)
+        submitted = st.form_submit_button(
+            "Ask PaperPilot",
+            type="primary",
+        )
 
-                    with st.expander("View Retrieved Source Passages & Page Citations"):
-                        for i, doc in enumerate(docs, start=1):
-                            page = doc.metadata.get("page_num", "?")
-                            st.markdown(f"**Chunk {i} — Page {page}**")
-                            st.caption(doc.page_content)
-                            if i < len(docs):
-                                st.divider()
-                except Exception as e:
-                    st.error(f"Error generating response: {e}")
+    if submitted and user_input.strip():
+
+        st.session_state.active_question = user_input.strip()
+
+    # --------------------------------------------------
+    # DISPLAY QUESTION AND ANSWER
+    # --------------------------------------------------
+
+    question = st.session_state.active_question
+
+    if question:
+
+        st.markdown("### Question")
+
+        st.info(question)
+
+        with st.spinner(
+            "Retrieving passages and generating answer..."
+        ):
+
+            try:
+
+                answer, docs = answer_question(
+                    st.session_state.vectorstore,
+                    question,
+                    api_key,
+                    model_name.strip() or CHAT_MODEL,
+                )
+
+                st.markdown("### Answer")
+
+                st.markdown(answer)
+
+                with st.expander(
+                    "📄 View retrieved passages and page citations"
+                ):
+
+                    for i, doc in enumerate(docs, start=1):
+
+                        page = doc.metadata.get("page_num", "?")
+
+                        st.markdown(
+                            f"**Passage {i} · PDF Page {page}**"
+                        )
+
+                        st.write(doc.page_content)
+
+                        if i < len(docs):
+                            st.divider()
+
+            except Exception as e:
+
+                show_friendly_error(e)
+
+                with st.expander("Technical error details"):
+                    st.code(str(e))
+
+        st.session_state.active_question = ""
+
+# --------------------------------------------------
+# FOOTER
+# --------------------------------------------------
 
 st.divider()
-st.caption("Verify important claims against the original paper. Answers may omit information not present in retrieved passages.")
+
+st.caption("""
+PaperPilot · PS36 · Research Paper Q&A
+
+Built using Python, Streamlit, Gemini, LangChain and FAISS.
+
+Always verify important findings and page citations against
+the original research paper.
+""")
+
